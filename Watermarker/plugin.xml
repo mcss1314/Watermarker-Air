@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin>
+<name>Watermarker-Air</name>
+<type>edit</type>
+<author>明日✿咲葉</author>
+<description>为选中图片添加水印</description>
+<engine>python3.4</engine>
+<version>1.1.3</version>
+<autostart>true</autostart>
+<autoclose>false</autoclose>
+<oslist>osx,win,unx</oslist>
+</plugin>
