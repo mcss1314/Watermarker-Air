@@ -15,7 +15,7 @@ from collections import deque
 from html.parser import HTMLParser
 
 # ==========================================
-# 1. 插件路径与第三方依赖加载 (自适应策略)
+# 1. 插件路径与第三方依赖加载
 # ==========================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _VENDOR_DIR = _PLUGIN_DIR / "vendor"
