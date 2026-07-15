@@ -4,94 +4,69 @@
 import os
 import sys
 import re
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from io import BytesIO
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+import queue
+from collections import deque
 from html.parser import HTMLParser
 
-# --- 1. 插件路径与第三方依赖加载 (方案三: 备胎策略) ---
+# ==========================================
+# 1. 插件路径与第三方依赖加载 (自适应策略)
+# ==========================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _VENDOR_DIR = _PLUGIN_DIR / "vendor"
 
 def setup_environment():
-    """
-    备胎策略：将 vendor 路径追加到 sys.path 末尾。
-    优先让系统/Sigil 加载其自带的同名依赖，防止插件包破坏宿主环境。
-    只有系统里完全没有这个包时，才会用到 vendor 里的内置包。
-    """
+    if not _VENDOR_DIR.exists():
+        _VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+        
     vendor_path = str(_VENDOR_DIR)
-    if _VENDOR_DIR.is_dir():
-        if vendor_path not in sys.path:
-            sys.path.append(vendor_path)  # 核心改动：使用 append 而不是 insert(0)
+    if vendor_path not in sys.path:
+        sys.path.insert(0, vendor_path)
             
-    # Windows DLL 加载逻辑 (主要针对依赖 C 运行时的扩展包)
     if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
         try:
             os.add_dll_directory(vendor_path)
-            iq_dir = _VENDOR_DIR / "imagequant"
-            if iq_dir.exists():
-                os.add_dll_directory(str(iq_dir))
+            for item in _VENDOR_DIR.iterdir():
+                # 兼容包含动态链接库的包 (如 .libs 后缀或 imagequant 扩展)
+                if item.is_dir() and (item.name.endswith('.libs') or item.name == 'imagequant'):
+                    os.add_dll_directory(str(item))
         except Exception:
             pass
 
 setup_environment()
 
-def _parse_version(v_str):
-    """提取并解析版本号，例如 '9.0.1' -> (9, 0, 1)"""
+# ==========================================
+# 2. 依赖检查与手动安装提示
+# ==========================================
+def check_dependencies():
     try:
-        match = re.search(r'^(\d+\.\d+(\.\d+)?)', str(v_str))
-        if match:
-            return tuple(map(int, match.group(1).split('.')))
-    except Exception:
-        pass
-    return (0, 0, 0)
-
-def check_dependencies_and_versions():
-    """
-    严格检查依赖库。
-    由于采用了 sys.path.append，极有可能加载的是宿主系统里的旧版本包，因此必须进行版本校验。
-    """
-    missing = []
-    outdated = []
-
-    # 检查 PyYAML (需 >= 5.1 支持 FullLoader)
-    try: 
         import yaml
-        if hasattr(yaml, '__version__') and _parse_version(yaml.__version__) < (5, 1):
-            outdated.append(f"pyyaml (当前 {yaml.__version__}，需 >= 5.1)")
-    except ImportError: 
-        missing.append("pyyaml")
-
-    # 检查 Pillow (建议 >= 9.0.0 以支持较新的 Resampling API)
-    try: 
         import PIL
         from PIL import Image
-        if hasattr(PIL, '__version__') and _parse_version(PIL.__version__) < (9, 0):
-            outdated.append(f"Pillow (当前 {PIL.__version__}，需 >= 9.0.0)")
-    except ImportError: 
-        missing.append("Pillow")
-
-    # 检查 resvg-py
-    try: 
         from resvg_py import svg_to_bytes
-    except ImportError: 
-        missing.append("resvg-py")
-
-    # 检查 cffi (明确告知是 imagequant 的依赖)
-    try:
         import cffi
-    except ImportError:
-        missing.append("cffi (imagequant 的底层依赖)")
-
-    # 检查 imagequant
-    try: 
         import imagequant
-    except ImportError: 
-        missing.append("imagequant")
+        
+        # 版本检查逻辑
+        def _parse_version(v_str):
+            match = re.search(r'^(\d+\.\d+(\.\d+)?)', str(v_str))
+            return tuple(map(int, match.group(1).split('.'))) if match else (0, 0, 0)
+            
+        if hasattr(yaml, '__version__') and _parse_version(yaml.__version__) < (5, 1):
+            return f"pyyaml 版本过低 (当前 {yaml.__version__}，需 >= 5.1)"
+            
+        if hasattr(PIL, '__version__') and _parse_version(PIL.__version__) < (8, 0):
+            return f"Pillow 版本过低 (当前 {PIL.__version__}，需 >= 8.0.0)"
+            
+        return None
+    except Exception as e:
+        return str(e)
 
-    return missing, outdated
 
 class ConfigError(RuntimeError): pass
 
@@ -105,7 +80,7 @@ def svg2img(svg_path: Path, svg_width: int):
         except Exception as e:
             raise UnidentifiedImageError(f"无法加载水印图片：{e}")
 
-# --- 2. 核心水印处理引擎 ---
+# --- 3. 核心水印处理引擎 ---
 class SigilWatermarker:
     default = {
         "threads": 4,
@@ -186,39 +161,64 @@ class SigilWatermarker:
             with Image.open(self.watermark_path) as img:
                 self._watermark_buffer = img.convert("RGBA").copy()
 
-    @property
-    def watermark_buffer(self):
-        return self._watermark_buffer.copy()
+        # 初始化时预计算透明度与旋转
+        self._prepare_watermark()
+
+    def _prepare_watermark(self):
+        from PIL import Image
+        # 优化：重采样滤波器缓存 (兼容 PIL 8.0)
+        self.resample_filter = getattr(Image.Resampling, 'LANCZOS', getattr(Image, 'LANCZOS', 1))
+        
+        wm = self._watermark_buffer.copy()
+        
+        # 优化：透明度预计算
+        if self.watermark_opacity < 1:
+            alpha = wm.getchannel('A')
+            alpha = alpha.point(lambda p: int(p * self.watermark_opacity))
+            wm.putalpha(alpha)
+            
+        # 优化：旋转预计算
+        if self.watermark_rotation != 0:
+            wm = wm.rotate(self.watermark_rotation, expand=True, resample=self.resample_filter)
+            
+        # 优化：绝对尺寸水印预缩放 (百分比水印在处理时动态缩放)
+        if not self.watermark_width_is_percent:
+            tw = self.watermark_width
+            th = tw * wm.height // wm.width
+            wm = wm.resize((tw, th), resample=self.resample_filter)
+            
+        self._prepared_watermark = wm
+        self._watermark_buffer = None  # 释放原始大图引用，降低内存占用
+        self._wm_cache = {}  # 引入按图片尺寸的水印缩放缓存字典
 
     def process_image_bytes(self, image_data: bytes) -> bytes:
         from PIL import Image
         import imagequant
 
-        # 核心优化：全部操作基于内存流，极速合成
         with Image.open(BytesIO(image_data)).convert("RGBA") as img:
             iw, ih = img.size
-            tw = iw * self.watermark_width // 100 if self.watermark_width_is_percent else self.watermark_width
-            th = tw * self._watermark_buffer.height // self._watermark_buffer.width
             
-            # 使用 getattr 兼容过低版本的 PIL (作为最后一道防线)
-            resample_filter = getattr(Image.Resampling, 'LANCZOS', getattr(Image, 'LANCZOS', 1))
-            wm_p = self.watermark_buffer.resize((tw, th), resample=resample_filter)
+            # 使用缓存或预加载好的水印本体
+            cache_key = (iw, ih)
             
-            if self.watermark_rotation != 0:
-                wm_p = wm_p.rotate(self.watermark_rotation, expand=True)
+            # 只有百分比模式才需要动态计算重采样
+            if self.watermark_width_is_percent:
+                if cache_key in self._wm_cache:
+                    wm_p = self._wm_cache[cache_key]
+                else:
+                    wm_p = self._prepared_watermark
+                    tw = iw * self.watermark_width // 100
+                    th = tw * wm_p.height // wm_p.width
+                    wm_p = wm_p.resize((tw, th), resample=self.resample_filter)
+                    self._wm_cache[cache_key] = wm_p
+            else:
+                wm_p = self._prepared_watermark
 
             mx = iw * self.watermark_x_margin // 100 if self.watermark_x_margin_is_percent else self.watermark_x_margin
             my = ih * self.watermark_y_margin // 100 if self.watermark_y_margin_is_percent else self.watermark_y_margin
             px = mx if self.watermark_x_begin == "left" else iw - wm_p.width - mx
             py = my if self.watermark_y_begin == "top" else ih - wm_p.height - my
 
-            # 内存/速度优化：仅针对水印区域修改 Alpha 通道
-            if self.watermark_opacity < 1:
-                alpha = wm_p.getchannel('A')
-                alpha = alpha.point(lambda p: int(p * self.watermark_opacity))
-                wm_p.putalpha(alpha)
-
-            # 速度优化：直接利用水印的 alpha 作为掩码贴图，避免全尺寸图层运算
             img.paste(wm_p, (px, py), mask=wm_p)
 
             out_io = BytesIO()
@@ -226,14 +226,17 @@ class SigilWatermarker:
             if save_fmt == "JPEG": 
                 img = img.convert("RGB")
             
-            if self.output_quality < 100 and save_fmt == "PNG":
+            if save_fmt == "WEBP":
+                # 微调 WebP 编码速度参数，去掉 optimize=True，增加 method=4
+                img.save(out_io, format=save_fmt, quality=self.output_quality, method=4)
+            elif self.output_quality < 100 and save_fmt == "PNG":
                 imagequant.quantize_pil_image(img, max_quality=self.output_quality).save(out_io, format="PNG")
             else:
                 img.save(out_io, format=save_fmt, quality=self.output_quality, optimize=True)
             
             return out_io.getvalue()
 
-# --- 3. Python 原生 HTML 解析器引擎 ---
+# --- 4. Python 原生 HTML 解析器引擎 (优化计数器机制) ---
 class NativeEpubHTMLParser(HTMLParser):
     def __init__(self, wm_config, img_map):
         super().__init__(convert_charrefs=True)
@@ -244,45 +247,75 @@ class NativeEpubHTMLParser(HTMLParser):
         
         self.extracted_ids = set()
         self.skipped_ids = set()
-        self.tag_stack = []
         
-        self.current_hierarchy_classes = set()
-        self.current_hierarchy_tags = set()
+        # 优化：采用更高效的计数器代替高开销的集合操作
+        self.tag_counter = {}
+        self.class_counter = {}
+        self.tag_stack = []
+
+    def _increment(self, counter, key):
+        counter[key] = counter.get(key, 0) + 1
+
+    def _decrement(self, counter, key):
+        if key in counter:
+            counter[key] -= 1
+            if counter[key] <= 0:
+                del counter[key]
 
     def handle_starttag(self, tag, attrs):
-        attr_dict = dict(attrs)
         tag = tag.lower()
-        classes = set(attr_dict.get('class', '').split())
+        self._increment(self.tag_counter, tag)
         
+        classes = []
+        for k, v in attrs:
+            if k == 'class':
+                classes = v.split()
+                for c in classes:
+                    self._increment(self.class_counter, c)
+                    
         self.tag_stack.append((tag, classes))
-        self.current_hierarchy_tags.add(tag)
-        self.current_hierarchy_classes.update(classes)
-        
-        self._check_image(tag, attr_dict)
+        self._check_image(tag, attrs)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
+        # 向上回溯弹出闭合标签对应的计数
         for i in range(len(self.tag_stack)-1, -1, -1):
             if self.tag_stack[i][0] == tag:
+                popped = self.tag_stack[i:]
                 del self.tag_stack[i:]
-                self.current_hierarchy_tags = {t for t, _ in self.tag_stack}
-                self.current_hierarchy_classes = set().union(*(cls for _, cls in self.tag_stack))
+                for pt, pclasses in popped:
+                    self._decrement(self.tag_counter, pt)
+                    for pc in pclasses:
+                        self._decrement(self.class_counter, pc)
                 break
 
     def handle_startendtag(self, tag, attrs):
-        attr_dict = dict(attrs)
         tag = tag.lower()
-        classes = set(attr_dict.get('class', '').split())
         
-        temp_tags = self.current_hierarchy_tags | {tag}
-        temp_classes = self.current_hierarchy_classes | classes
-        self._check_image(tag, attr_dict, temp_tags, temp_classes)
+        self._increment(self.tag_counter, tag)
+        classes = []
+        for k, v in attrs:
+            if k == 'class':
+                classes = v.split()
+                for c in classes:
+                    self._increment(self.class_counter, c)
+            
+        self._check_image(tag, attrs)
+        
+        self._decrement(self.tag_counter, tag)
+        for c in classes:
+            self._decrement(self.class_counter, c)
 
-    def _check_image(self, tag, attr_dict, current_tags=None, current_classes=None):
+    def _check_image(self, tag, attrs):
         if tag not in ('img', 'image'):
             return
             
-        src = attr_dict.get('src') or attr_dict.get('xlink:href') or attr_dict.get('href')
+        src = None
+        for k, v in attrs:
+            if k in ('src', 'xlink:href', 'href'):
+                src = v
+                break
+
         if not src: 
             return
         
@@ -292,17 +325,15 @@ class NativeEpubHTMLParser(HTMLParser):
         
         img_id = self.image_map[img_basename]
         
-        tags_to_check = current_tags if current_tags is not None else self.current_hierarchy_tags
-        classes_to_check = current_classes if current_classes is not None else self.current_hierarchy_classes
-        
-        if (self.exclude_classes.intersection(classes_to_check) or 
-            self.exclude_tags.intersection(tags_to_check) or 
+        # 优化：采用 dict_keys 视图做直接的 O(1) 交集匹配 (isdisjoint 运算)
+        if (not self.exclude_classes.isdisjoint(self.class_counter.keys()) or 
+            not self.exclude_tags.isdisjoint(self.tag_counter.keys()) or 
             img_basename in self.exclude_images):
             self.skipped_ids.add(img_id)
         else:
             self.extracted_ids.add(img_id)
 
-# --- 4. 彻底重构的 UI 交互与调度引擎 ---
+# --- 5. 彻底重构的 UI 交互与异步流调度引擎 ---
 class WatermarkApp:
     def __init__(self, root, bk, config, config_path):
         self.root = root
@@ -332,62 +363,113 @@ class WatermarkApp:
             pass
 
     def _build_ui(self):
-        self.root.title("图片水印 - 章节选择")
-        self.root.minsize(500, 480)
+        self.root.title("Watermarker-Air V1.1.5")
+        self.root.geometry("600x590")
+        self.root.minsize(580, 560)
         self.root.eval('tk::PlaceWindow . center')
 
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_rowconfigure(1, weight=1) 
+        # -----------------------------
+        # UI 样式全局定义区
+        # -----------------------------
+        style = ttk.Style()
+        # 根据系统自适应最佳字体
+        os_font = "微软雅黑" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif"
+        code_font = "Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace"
+        
+        style.configure(".", font=(os_font, 10))
+        style.configure("Treeview", rowheight=28, font=(code_font, 10))
+        style.configure("Treeview.Heading", font=(os_font, 10, "bold"))
+        
+        # 定制按钮样式
+        style.configure("Primary.TButton", font=(os_font, 10, "bold"), padding=(15, 6))
+        style.configure("Secondary.TButton", font=(os_font, 10), padding=(10, 4))
+        style.configure("TCheckbutton", font=(os_font, 10))
 
+        # 主容器：所有元素被包裹在一个带内边距的主 Frame 中
+        main_frame = ttk.Frame(self.root, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # -----------------------------
+        # 1. 顶部说明区
+        # -----------------------------
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.lbl_title = ttk.Label(header_frame, text="📚 选择需要扫描的 HTML 章节", font=(os_font, 13, "bold"))
+        self.lbl_title.pack(anchor=tk.W, pady=(0, 4))
+        
         self.lbl_hint = ttk.Label(
-            self.root, 
-            text="注意：请在下方列表中，Ctrl选取或Shift选取。\n【二次确认】开启后，将允许你可视化核对并修改即将被处理的图片名单。", 
-            foreground="red", 
-            justify=tk.CENTER
+            header_frame, 
+            text="按住 Ctrl 或 Shift 选择多个章节", 
+            foreground="#666666"
         )
-        self.lbl_hint.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
+        self.lbl_hint.pack(anchor=tk.W)
 
-        tree_height = max(8, min(len(self.text_iter), 15)) if self.text_iter else 8
-        self.tree = ttk.Treeview(self.root, columns=("Data1", "Data2"), show="headings", height=tree_height, selectmode="extended")
+        # -----------------------------
+        # 2. 核心列表区
+        # -----------------------------
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # 改用 grid 布局来解决列表右侧滑动条导致的上下不对齐问题
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(list_frame, columns=("Data1", "Data2"), show="headings", selectmode="extended")
         self.tree.column("#0", width=0, stretch=tk.NO)
-        self.tree.column("Data1", anchor=tk.W, width=150, stretch=tk.YES)
-        self.tree.column("Data2", anchor=tk.W, width=280, stretch=tk.YES)
-        self.tree.heading("Data1", text="文件标识 (ID)")
+        # 设置宽度相同并全部开启拉伸，使其各占一半
+        self.tree.column("Data1", anchor=tk.W, width=300, minwidth=150, stretch=tk.YES)
+        self.tree.column("Data2", anchor=tk.W, width=300, minwidth=150, stretch=tk.YES)
+        self.tree.heading("Data1", text="节点标识 (ID)")
         self.tree.heading("Data2", text="文件路径 (Href)")
-        self.tree.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        scroll_bar = ttk.Scrollbar(self.root, orient=tk.VERTICAL, command=self.tree.yview)
+        
+        scroll_bar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll_bar.set)
-        scroll_bar.grid(row=1, column=2, sticky=(tk.N, tk.S))
+        
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scroll_bar.grid(row=0, column=1, sticky='ns')
 
         for index, (data1, data2) in enumerate(self.text_iter):
             item_id = self.tree.insert(parent="", index=tk.END, iid=f"html_{index}", values=(data1, data2))
-            if data1 in self.pre_selected_html_ids:
-                self.tree.selection_add(item_id)
-
-        self.btn_frame = ttk.Frame(self.root)
-        self.btn_frame.grid(row=2, column=0, columnspan=3, pady=(10, 5))
-        ttk.Button(self.btn_frame, text="全选", command=lambda: self.tree.selection_add(self.tree.get_children())).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.btn_frame, text="取消全选", command=lambda: self.tree.selection_remove(self.tree.get_children())).pack(side=tk.LEFT, padx=5)
+            self.tree.selection_add(item_id) # 默认全选
+            
+        self.root.bind('<Control-a>', lambda e: self.tree.selection_add(self.tree.get_children()))
+        self.root.bind('<Command-a>', lambda e: self.tree.selection_add(self.tree.get_children()))
+        self.root.bind('<Return>', lambda e: self.run_action())
         
-        self.action_frame = ttk.Frame(self.root)
-        self.action_frame.grid(row=3, column=0, columnspan=3, pady=(5, 10))
+        # -----------------------------
+        # 3. 操作按钮区 (重新布局：左右分栏)
+        # -----------------------------
+        self.action_frame = ttk.Frame(main_frame)
+        self.action_frame.pack(fill=tk.X, pady=(10, 5))
         
-        self.btn_open_config = ttk.Button(self.action_frame, text="打开配置单", command=self.open_config_file)
-        self.btn_open_config.pack(side=tk.LEFT, padx=5)
+        # 左侧区域：辅助设置
+        left_controls = ttk.Frame(self.action_frame)
+        left_controls.pack(side=tk.LEFT, fill=tk.Y)
 
+        self.btn_open_config = ttk.Button(left_controls, text="⚙️ 唤起配置单", style="Secondary.TButton", command=self.open_config_file)
+        self.btn_open_config.pack(side=tk.LEFT)
+        
+        # 右侧区域：主动作与二次确认
+        right_controls = ttk.Frame(self.action_frame)
+        right_controls.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.btn_main = ttk.Button(right_controls, text="🚀 扫描并处理", style="Primary.TButton", command=self.run_action)
+        self.btn_main.pack(side=tk.RIGHT)
+        
         self.secondary_confirm_var = tk.BooleanVar(value=False)
-        self.chk_confirm = ttk.Checkbutton(self.action_frame, text="二次确认", variable=self.secondary_confirm_var)
-        self.chk_confirm.pack(side=tk.LEFT, padx=5)
-        
-        self.btn_main = ttk.Button(self.action_frame, text="开始处理", command=self.run_action)
-        self.btn_main.pack(side=tk.LEFT, padx=5)
+        self.chk_confirm = ttk.Checkbutton(right_controls, text="🔍 图片二次确认", style="TCheckbutton", variable=self.secondary_confirm_var)
+        self.chk_confirm.pack(side=tk.RIGHT, padx=(0, 15))
 
-        self.progress = ttk.Progressbar(self.root, mode='determinate', length=400)
-        self.progress.grid(row=4, column=0, columnspan=3, padx=10, pady=(10, 5), sticky=(tk.W, tk.E))
-        self.progress_label = ttk.Label(self.root, text="等待开始...")
-        self.progress_label.grid(row=5, column=0, columnspan=3, pady=(0, 10))
+        # -----------------------------
+        # 4. 进度条状态区
+        # -----------------------------
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.progress = ttk.Progressbar(status_frame, mode='determinate')
+        self.progress.pack(side=tk.TOP, fill=tk.X)
+
 
     def open_config_file(self):
         import subprocess
@@ -406,61 +488,118 @@ class WatermarkApp:
 
     def _set_ui_state(self, state):
         if state == tk.DISABLED:
-            btn_text = "正在处理中..."
+            btn_text = "⏳ 正在处理中"
         else:
-            btn_text = "确认并执行" if self.phase == 2 else "开始处理"
+            btn_text = "✅ 确认并执行" if self.phase == 2 else "🚀 扫描并处理"
             
         self.btn_main.config(state=state, text=btn_text)
         self.tree.config(selectmode='none' if state == tk.DISABLED else 'extended')
         
         chk_state = tk.NORMAL if (state == tk.NORMAL and self.phase == 1) else tk.DISABLED
         self.chk_confirm.config(state=chk_state)
-        
         self.btn_open_config.config(state=state)
-        for btn in self.btn_frame.winfo_children(): 
-            btn.config(state=state)
-        self.root.update()
+        
+        self.root.update_idletasks()
+
+    def _worker_task(self, uid, img_data):
+        """线程池内的安全任务封装，负责向 Queue 抛回结果"""
+        try:
+            result = self.wm.process_image_bytes(img_data)
+            self.result_queue.put((uid, True, result))
+        except Exception as e:
+            self.result_queue.put((uid, False, e))
+
+    def _fill_executor(self):
+        """流式分块读取：保持活动任务数量不超过线程数的 2 倍，防止电子书过大撑爆内存"""
+        target_active = self.wm.threads * 2
+        while len(self.active_futures) < target_active and self.final_process_queue:
+            uid = self.final_process_queue.popleft()
+            try:
+                # 必须在主线程触发宿主的 readfile
+                img_data = self.bk.readfile(uid)
+                future = self.executor.submit(self._worker_task, uid, img_data)
+                self.active_futures[future] = uid
+            except Exception as e:
+                print(f"读取图片失败 {uid}: {e}")
+                self.skipped_image_ids.add(uid)
+                self._update_progress()
+
+    def _update_progress(self):
+        self.progress['value'] += 1
+        # 优化：批量更新机制，限制重绘频率以降低 CPU 开销
+        current_time = time.time()
+        if current_time - self.last_update_time > 0.1:
+            self.root.update_idletasks()
+            self.last_update_time = current_time
+
+    def _check_queue_and_refill(self):
+        """after 定时轮询收集 Queue，实现完全非阻塞 UI 流畅过渡"""
+        try:
+            while True:
+                uid, success, data_or_err = self.result_queue.get_nowait()
+                
+                if success:
+                    try:
+                        self.bk.writefile(uid, data_or_err)
+                        self.success_ids.append(uid)
+                    except Exception as e:
+                        print(f"写入图片失败 {uid}: {e}")
+                        self.skipped_image_ids.add(uid)
+                else:
+                    print(f"渲染失败 {uid}: {data_or_err}")
+                    self.skipped_image_ids.add(uid)
+                    
+                self._update_progress()
+        except queue.Empty:
+            pass
+
+        # 剥离已完成的任务池引用
+        done_futures = [f for f in self.active_futures if f.done()]
+        for f in done_futures:
+            del self.active_futures[f]
+
+        # 及时补充分块读取的任务
+        self._fill_executor()
+
+        # 全部结束判断
+        if not self.active_futures and not self.final_process_queue:
+            self.executor.shutdown(wait=False)
+            self.root.update_idletasks()  # 确保最后一次进度正确触达 100%
+            self._print_report(self.success_ids, self.skipped_image_ids)
+            messagebox.showinfo("处理完成", f"批量水印添加完毕！\n\n✅ 成功打上水印: {len(self.success_ids)} 张\n🛑 跳过或被拦截: {len(self.skipped_image_ids)} 张\n\n详细名单请查看 Sigil 控制台输出。")
+            self.root.destroy()
+        else:
+            self.root.after(50, self._check_queue_and_refill)
 
     def process_images_batch(self, final_process_queue, skipped_image_ids):
         if not final_process_queue:
-            messagebox.showinfo("完成", "未找到符合条件的图片，或图片均被拦截。")
+            messagebox.showinfo("完成", "当前节点下未找到符合条件的图片，或图片已全部被黑名单拦截。")
             self.root.destroy()
             return
 
         self._set_ui_state(tk.DISABLED)
         self.progress['maximum'] = len(final_process_queue)
         self.progress['value'] = 0
-        success_ids = []
-
-        batch_size = max(4, self.wm.threads * 2) 
-
-        with ThreadPoolExecutor(max_workers=self.wm.threads) as executor:
-            for i in range(0, len(final_process_queue), batch_size):
-                batch_uids = final_process_queue[i:i + batch_size]
-                future_to_id = {}
-                
-                for uid in batch_uids:
-                    image_data = self.bk.readfile(uid)
-                    future = executor.submit(self.wm.process_image_bytes, image_data)
-                    future_to_id[future] = uid
-                
-                for future in as_completed(future_to_id):
-                    img_id = future_to_id[future]
-                    try:
-                        result_data = future.result()
-                        self.bk.writefile(img_id, result_data)
-                        success_ids.append(img_id)
-                    except Exception as e:
-                        print(f"渲染失败 {img_id}: {e}")
-                        skipped_image_ids.add(img_id)
-                    
-                    self.progress['value'] += 1
-                    self.progress_label.config(text=f"正在添加水印... {self.progress['value']}/{len(final_process_queue)}")
-                    self.root.update()
-
-        self._print_report(success_ids, skipped_image_ids)
-        messagebox.showinfo("完成", f"批量水印添加完毕！\n成功: {len(success_ids)} 张\n跳过: {len(skipped_image_ids)} 张\n详细名单请查看 Sigil 控制台输出。")
-        self.root.destroy()
+        
+        self.success_ids = []
+        self.skipped_image_ids = skipped_image_ids
+        # 优化：引入 collections.deque 替代 List 实现 O(1) 的 popleft()
+        self.final_process_queue = deque(final_process_queue)
+        self.last_update_time = time.time()
+        
+        self.result_queue = queue.Queue()
+        self.active_futures = {}
+        
+        # 优化引擎：引入并发池，搭配流式读取与非阻塞 Queue。
+        # 注意：Sigil 插件内置环境对于 ProcessPoolExecutor 进行 Pickle 极易引发模块重载错误与宿主闪退。
+        # 这里统一降级绑定为 ThreadPoolExecutor（PIL 在底层处理时会自动释放 GIL 锁，完美模拟了多核多进程能力）。
+        self.executor = ThreadPoolExecutor(max_workers=self.wm.threads)
+        
+        # 首次注水
+        self._fill_executor()
+        
+        # 激活非阻塞 UI 轮询
+        self.root.after(100, self._check_queue_and_refill)
 
     def _print_report(self, success_ids, skipped_image_ids):
         print("=" * 50)
@@ -485,7 +624,7 @@ class WatermarkApp:
                 return
 
             self._set_ui_state(tk.DISABLED)
-            self.progress_label.config(text="正在解析 HTML 与黑名单...")
+            self.root.update_idletasks()
             
             selected_html_ids = [item[0] for item in selected_items]
             target_image_ids = set()
@@ -518,9 +657,12 @@ class WatermarkApp:
 
             if self.secondary_confirm_var.get():
                 self.phase = 2
-                self.root.title("图片水印 - 图片二次确认")
-                self.lbl_hint.config(text="【二次确认】：下方为全书所有图片。即将被处理的图片已高亮选中，请按需调整后点击执行。")
-                self.progress_label.config(text="请确认待处理图片...")
+                self.root.title("Watermarker-Air - 目标确认阶段")
+                self.lbl_title.config(text="🎯 核对并确认待处理的图片清单")
+                self.lbl_hint.config(
+                    text="下方展示了将被打上水印的所有图片（已被黑名单过滤）", 
+                    foreground="#666666"
+                )
                 
                 for item in self.tree.get_children():
                     self.tree.delete(item)
@@ -560,31 +702,66 @@ class WatermarkApp:
                     
             self.process_images_batch(final_process_queue, skipped_image_ids)
 
-# --- 5. Sigil 插件入口 ---
+# --- 6. Sigil 插件入口 ---
 def run(bk):
-    missing, outdated = check_dependencies_and_versions()
+    # 增强跨平台 UI 兼容性：主动设置 Windows 高 DPI 缩放感知
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+    err_msg = check_dependencies()
     
-    if missing or outdated:
-        err_msg = "【依赖环境异常】\n为了防止干扰您的宿主环境，插件优先使用了您系统的本地包，但检测到异常：\n"
+    if err_msg:
+        # 将错误弹窗逻辑嵌入到入口处，防止阻塞加载
+        err_root = tk.Tk()
+        err_root.withdraw()
         
-        if missing:
-            err_msg += f"\n❌ 缺少库: {', '.join(missing)}"
-        if outdated:
-            err_msg += "\n\n⚠️ 版本过低（可能导致报错或崩溃）:"
-            for pkg in outdated:
-                err_msg += f"\n  - {pkg}"
-                
-        err_msg += ("\n\n【修复建议】\n请在您的命令行或终端中运行以下命令更新环境："
-                    "\n\npip install --upgrade Pillow pyyaml resvg-py cffi imagequant")
+        guide_win = tk.Toplevel()
+        guide_win.title("⚠️ 插件环境异常")
+        guide_win.geometry("600x360")
         
-        print("="*50)
-        print(err_msg)
-        print("="*50)
+        # 跨平台字体回退机制
+        ui_font = ("微软雅黑" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif", 10)
+        code_font = ("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace", 10)
         
-        tmp_root = tk.Tk()
-        tmp_root.withdraw()
-        messagebox.showerror("环境异常", err_msg)
-        tmp_root.destroy()
+        # 窗口居中
+        guide_win.update_idletasks()
+        win_x = (guide_win.winfo_screenwidth() // 2) - (600 // 2)
+        win_y = (guide_win.winfo_screenheight() // 2) - (320 // 2)
+        guide_win.geometry(f'+{win_x}+{win_y}')
+        
+        top_frame = tk.Frame(guide_win, padx=25, pady=20)
+        top_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(top_frame, text="由于缺失必要的核心组件，插件无法启动。", font=(ui_font[0], 12, "bold"), fg="#d9534f").pack(anchor=tk.W, pady=(0, 10))
+        
+        info_text = (
+            f"具体拦截原因: {err_msg}\n\n"
+            f"请按下 Win+R 打开 [cmd] 命令行 (macOS 请使用终端)，\n"
+            f"复制并执行下方的自动修复指令将依赖装入插件目录中："
+        )
+        tk.Label(top_frame, text=info_text, justify=tk.LEFT, font=ui_font).pack(anchor=tk.W)
+        
+        # 生成基于当前 Sigil 水印插件所需包的专属 pip 安装命令
+        cmd_str = f'pip install pyyaml Pillow resvg-py cffi imagequant --target="{str(_VENDOR_DIR)}"'
+        
+        text_box = tk.Text(top_frame, height=3, width=70, bg="#f5f6f7", font=code_font, relief=tk.FLAT)
+        text_box.insert(tk.END, cmd_str)
+        text_box.config(state=tk.DISABLED)
+        text_box.pack(pady=15, fill=tk.X)
+        
+        def copy_cmd():
+            guide_win.clipboard_clear()
+            guide_win.clipboard_append(cmd_str)
+            messagebox.showinfo("已复制", "命令已复制到剪贴板！\n\n请打开命令行界面右键粘贴并回车执行。\n安装完毕后重新启动本插件即可。", parent=guide_win)
+            
+        ttk.Button(top_frame, text="📋 一键复制修复指令", command=copy_cmd, padding=5).pack(pady=(5,0))
+        
+        guide_win.wait_window()
+        err_root.destroy()
         return -1
 
     config_path = _PLUGIN_DIR / "watermarker_config.yaml"
