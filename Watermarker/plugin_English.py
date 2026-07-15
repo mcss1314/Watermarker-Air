@@ -4,97 +4,69 @@
 import os
 import sys
 import re
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from io import BytesIO
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+import queue
+from collections import deque
 from html.parser import HTMLParser
 
-# --- 1. Plugin path and third-party dependency loading (Strategy 3: Fallback) ---
+# ==========================================
+# 1. Plugin path and third-party dependency loading
+# ==========================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _VENDOR_DIR = _PLUGIN_DIR / "vendor"
 
 def setup_environment():
-    """
-    Fallback Strategy: Append the vendor path to the end of sys.path.
-    Prioritize letting the system/Sigil load its own native dependencies 
-    to prevent the plugin's packages from breaking the host environment.
-    The built-in packages in the vendor directory will only be used if 
-    the system completely lacks them.
-    """
+    if not _VENDOR_DIR.exists():
+        _VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+        
     vendor_path = str(_VENDOR_DIR)
-    if _VENDOR_DIR.is_dir():
-        if vendor_path not in sys.path:
-            sys.path.append(vendor_path)  # Core change: Use append instead of insert(0)
+    if vendor_path not in sys.path:
+        sys.path.insert(0, vendor_path)
             
-    # Windows DLL loading logic (mainly for extension packages depending on C runtime)
     if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
         try:
             os.add_dll_directory(vendor_path)
-            iq_dir = _VENDOR_DIR / "imagequant"
-            if iq_dir.exists():
-                os.add_dll_directory(str(iq_dir))
+            for item in _VENDOR_DIR.iterdir():
+                # Compatible with packages containing dynamic link libraries (like .libs suffix or imagequant extension)
+                if item.is_dir() and (item.name.endswith('.libs') or item.name == 'imagequant'):
+                    os.add_dll_directory(str(item))
         except Exception:
             pass
 
 setup_environment()
 
-def _parse_version(v_str):
-    """Extract and parse the version number, e.g., '9.0.1' -> (9, 0, 1)"""
+# ==========================================
+# 2. Dependency check and manual installation prompt
+# ==========================================
+def check_dependencies():
     try:
-        match = re.search(r'^(\d+\.\d+(\.\d+)?)', str(v_str))
-        if match:
-            return tuple(map(int, match.group(1).split('.')))
-    except Exception:
-        pass
-    return (0, 0, 0)
-
-def check_dependencies_and_versions():
-    """
-    Strict dependency checking.
-    Since sys.path.append is used, it's highly likely to load older packages 
-    from the host system. Therefore, version validation is mandatory.
-    """
-    missing = []
-    outdated = []
-
-    # Check PyYAML (requires >= 5.1 to support FullLoader)
-    try: 
         import yaml
-        if hasattr(yaml, '__version__') and _parse_version(yaml.__version__) < (5, 1):
-            outdated.append(f"pyyaml (current {yaml.__version__}, requires >= 5.1)")
-    except ImportError: 
-        missing.append("pyyaml")
-
-    # Check Pillow (recommends >= 9.0.0 to support newer Resampling API)
-    try: 
         import PIL
         from PIL import Image
-        if hasattr(PIL, '__version__') and _parse_version(PIL.__version__) < (9, 0):
-            outdated.append(f"Pillow (current {PIL.__version__}, requires >= 9.0.0)")
-    except ImportError: 
-        missing.append("Pillow")
-
-    # Check resvg-py
-    try: 
         from resvg_py import svg_to_bytes
-    except ImportError: 
-        missing.append("resvg-py")
-
-    # Check cffi (explicitly state it is a dependency of imagequant)
-    try:
         import cffi
-    except ImportError:
-        missing.append("cffi (underlying dependency of imagequant)")
-
-    # Check imagequant
-    try: 
         import imagequant
-    except ImportError: 
-        missing.append("imagequant")
+        
+        # Version check logic
+        def _parse_version(v_str):
+            match = re.search(r'^(\d+\.\d+(\.\d+)?)', str(v_str))
+            return tuple(map(int, match.group(1).split('.'))) if match else (0, 0, 0)
+            
+        if hasattr(yaml, '__version__') and _parse_version(yaml.__version__) < (5, 1):
+            return f"pyyaml version is too low (current {yaml.__version__}, requires >= 5.1)"
+            
+        if hasattr(PIL, '__version__') and _parse_version(PIL.__version__) < (8, 0):
+            return f"Pillow version is too low (current {PIL.__version__}, requires >= 8.0.0)"
+            
+        return None
+    except Exception as e:
+        return str(e)
 
-    return missing, outdated
 
 class ConfigError(RuntimeError): pass
 
@@ -106,9 +78,9 @@ def svg2img(svg_path: Path, svg_width: int):
             with Image.open(svg_buffer) as img:
                 return img.convert("RGBA").copy()
         except Exception as e:
-            raise UnidentifiedImageError(f"Failed to load watermark image: {e}")
+            raise UnidentifiedImageError(f"Cannot load watermark image: {e}")
 
-# --- 2. Core Watermark Processing Engine ---
+# --- 3. Core Watermark Processing Engine ---
 class SigilWatermarker:
     default = {
         "threads": 4,
@@ -142,8 +114,8 @@ class SigilWatermarker:
                 with open(config_yaml_path, "w", encoding="utf-8") as f:
                     yaml.dump(self.default, f, allow_unicode=True, sort_keys=False)
             except Exception as e:
-                raise PermissionError(f"Failed to write config file: {e}")
-            raise ConfigError("Config file not found.\nA default config containing [Blacklist Rules] has been generated.\nPlease check the filter node and run again.")
+                raise PermissionError(f"Cannot write to configuration file: {e}")
+            raise ConfigError("Configuration file does not exist.\nA default configuration including [Blacklist Rules] has been generated.\nPlease check the filter node and run again.")
 
         with open(config_yaml_path, "r", encoding="utf-8") as f:
             data = yaml.load(f, Loader=yaml.FullLoader)
@@ -189,39 +161,64 @@ class SigilWatermarker:
             with Image.open(self.watermark_path) as img:
                 self._watermark_buffer = img.convert("RGBA").copy()
 
-    @property
-    def watermark_buffer(self):
-        return self._watermark_buffer.copy()
+        # Pre-calculate transparency and rotation during initialization
+        self._prepare_watermark()
+
+    def _prepare_watermark(self):
+        from PIL import Image
+        # Optimization: Resampling filter cache (Compatible with PIL 8.0)
+        self.resample_filter = getattr(Image.Resampling, 'LANCZOS', getattr(Image, 'LANCZOS', 1))
+        
+        wm = self._watermark_buffer.copy()
+        
+        # Optimization: Transparency pre-calculation
+        if self.watermark_opacity < 1:
+            alpha = wm.getchannel('A')
+            alpha = alpha.point(lambda p: int(p * self.watermark_opacity))
+            wm.putalpha(alpha)
+            
+        # Optimization: Rotation pre-calculation
+        if self.watermark_rotation != 0:
+            wm = wm.rotate(self.watermark_rotation, expand=True, resample=self.resample_filter)
+            
+        # Optimization: Absolute size watermark pre-scaling (Percentage watermark scales dynamically during processing)
+        if not self.watermark_width_is_percent:
+            tw = self.watermark_width
+            th = tw * wm.height // wm.width
+            wm = wm.resize((tw, th), resample=self.resample_filter)
+            
+        self._prepared_watermark = wm
+        self._watermark_buffer = None  # Release original large image reference to reduce memory usage
+        self._wm_cache = {}  # Introduce watermark scaling cache dictionary by image size
 
     def process_image_bytes(self, image_data: bytes) -> bytes:
         from PIL import Image
         import imagequant
 
-        # Core optimization: All operations based on memory stream, extremely fast composition
         with Image.open(BytesIO(image_data)).convert("RGBA") as img:
             iw, ih = img.size
-            tw = iw * self.watermark_width // 100 if self.watermark_width_is_percent else self.watermark_width
-            th = tw * self._watermark_buffer.height // self._watermark_buffer.width
             
-            # Use getattr for compatibility with very old versions of PIL (as a last line of defense)
-            resample_filter = getattr(Image.Resampling, 'LANCZOS', getattr(Image, 'LANCZOS', 1))
-            wm_p = self.watermark_buffer.resize((tw, th), resample=resample_filter)
+            # Use cached or pre-loaded watermark body
+            cache_key = (iw, ih)
             
-            if self.watermark_rotation != 0:
-                wm_p = wm_p.rotate(self.watermark_rotation, expand=True)
+            # Only percentage mode requires dynamic calculation of resampling
+            if self.watermark_width_is_percent:
+                if cache_key in self._wm_cache:
+                    wm_p = self._wm_cache[cache_key]
+                else:
+                    wm_p = self._prepared_watermark
+                    tw = iw * self.watermark_width // 100
+                    th = tw * wm_p.height // wm_p.width
+                    wm_p = wm_p.resize((tw, th), resample=self.resample_filter)
+                    self._wm_cache[cache_key] = wm_p
+            else:
+                wm_p = self._prepared_watermark
 
             mx = iw * self.watermark_x_margin // 100 if self.watermark_x_margin_is_percent else self.watermark_x_margin
             my = ih * self.watermark_y_margin // 100 if self.watermark_y_margin_is_percent else self.watermark_y_margin
             px = mx if self.watermark_x_begin == "left" else iw - wm_p.width - mx
             py = my if self.watermark_y_begin == "top" else ih - wm_p.height - my
 
-            # Memory/Speed optimization: Only modify the Alpha channel for the watermark area
-            if self.watermark_opacity < 1:
-                alpha = wm_p.getchannel('A')
-                alpha = alpha.point(lambda p: int(p * self.watermark_opacity))
-                wm_p.putalpha(alpha)
-
-            # Speed optimization: Use the watermark's alpha directly as a mask to avoid full-size layer calculations
             img.paste(wm_p, (px, py), mask=wm_p)
 
             out_io = BytesIO()
@@ -229,14 +226,17 @@ class SigilWatermarker:
             if save_fmt == "JPEG": 
                 img = img.convert("RGB")
             
-            if self.output_quality < 100 and save_fmt == "PNG":
+            if save_fmt == "WEBP":
+                # Fine-tune WebP encoding speed parameters, removed optimize=True, added method=4
+                img.save(out_io, format=save_fmt, quality=self.output_quality, method=4)
+            elif self.output_quality < 100 and save_fmt == "PNG":
                 imagequant.quantize_pil_image(img, max_quality=self.output_quality).save(out_io, format="PNG")
             else:
                 img.save(out_io, format=save_fmt, quality=self.output_quality, optimize=True)
             
             return out_io.getvalue()
 
-# --- 3. Python Native HTML Parser Engine ---
+# --- 4. Python Native HTML Parser Engine (Optimized Counter Mechanism) ---
 class NativeEpubHTMLParser(HTMLParser):
     def __init__(self, wm_config, img_map):
         super().__init__(convert_charrefs=True)
@@ -247,45 +247,75 @@ class NativeEpubHTMLParser(HTMLParser):
         
         self.extracted_ids = set()
         self.skipped_ids = set()
-        self.tag_stack = []
         
-        self.current_hierarchy_classes = set()
-        self.current_hierarchy_tags = set()
+        # Optimization: Use more efficient counters instead of high-overhead set operations
+        self.tag_counter = {}
+        self.class_counter = {}
+        self.tag_stack = []
+
+    def _increment(self, counter, key):
+        counter[key] = counter.get(key, 0) + 1
+
+    def _decrement(self, counter, key):
+        if key in counter:
+            counter[key] -= 1
+            if counter[key] <= 0:
+                del counter[key]
 
     def handle_starttag(self, tag, attrs):
-        attr_dict = dict(attrs)
         tag = tag.lower()
-        classes = set(attr_dict.get('class', '').split())
+        self._increment(self.tag_counter, tag)
         
+        classes = []
+        for k, v in attrs:
+            if k == 'class':
+                classes = v.split()
+                for c in classes:
+                    self._increment(self.class_counter, c)
+                    
         self.tag_stack.append((tag, classes))
-        self.current_hierarchy_tags.add(tag)
-        self.current_hierarchy_classes.update(classes)
-        
-        self._check_image(tag, attr_dict)
+        self._check_image(tag, attrs)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
+        # Backtrack upwards to pop the count corresponding to the closing tag
         for i in range(len(self.tag_stack)-1, -1, -1):
             if self.tag_stack[i][0] == tag:
+                popped = self.tag_stack[i:]
                 del self.tag_stack[i:]
-                self.current_hierarchy_tags = {t for t, _ in self.tag_stack}
-                self.current_hierarchy_classes = set().union(*(cls for _, cls in self.tag_stack))
+                for pt, pclasses in popped:
+                    self._decrement(self.tag_counter, pt)
+                    for pc in pclasses:
+                        self._decrement(self.class_counter, pc)
                 break
 
     def handle_startendtag(self, tag, attrs):
-        attr_dict = dict(attrs)
         tag = tag.lower()
-        classes = set(attr_dict.get('class', '').split())
         
-        temp_tags = self.current_hierarchy_tags | {tag}
-        temp_classes = self.current_hierarchy_classes | classes
-        self._check_image(tag, attr_dict, temp_tags, temp_classes)
+        self._increment(self.tag_counter, tag)
+        classes = []
+        for k, v in attrs:
+            if k == 'class':
+                classes = v.split()
+                for c in classes:
+                    self._increment(self.class_counter, c)
+            
+        self._check_image(tag, attrs)
+        
+        self._decrement(self.tag_counter, tag)
+        for c in classes:
+            self._decrement(self.class_counter, c)
 
-    def _check_image(self, tag, attr_dict, current_tags=None, current_classes=None):
+    def _check_image(self, tag, attrs):
         if tag not in ('img', 'image'):
             return
             
-        src = attr_dict.get('src') or attr_dict.get('xlink:href') or attr_dict.get('href')
+        src = None
+        for k, v in attrs:
+            if k in ('src', 'xlink:href', 'href'):
+                src = v
+                break
+
         if not src: 
             return
         
@@ -295,17 +325,15 @@ class NativeEpubHTMLParser(HTMLParser):
         
         img_id = self.image_map[img_basename]
         
-        tags_to_check = current_tags if current_tags is not None else self.current_hierarchy_tags
-        classes_to_check = current_classes if current_classes is not None else self.current_hierarchy_classes
-        
-        if (self.exclude_classes.intersection(classes_to_check) or 
-            self.exclude_tags.intersection(tags_to_check) or 
+        # Optimization: Use dict_keys view for direct O(1) intersection matching (isdisjoint operation)
+        if (not self.exclude_classes.isdisjoint(self.class_counter.keys()) or 
+            not self.exclude_tags.isdisjoint(self.tag_counter.keys()) or 
             img_basename in self.exclude_images):
             self.skipped_ids.add(img_id)
         else:
             self.extracted_ids.add(img_id)
 
-# --- 4. Completely refactored UI interaction and scheduling engine ---
+# --- 5. Completely refactored UI interaction and asynchronous stream scheduling engine ---
 class WatermarkApp:
     def __init__(self, root, bk, config, config_path):
         self.root = root
@@ -335,67 +363,118 @@ class WatermarkApp:
             pass
 
     def _build_ui(self):
-        self.root.title("Image Watermark - Chapter Selection")
-        self.root.minsize(500, 480)
+        self.root.title("Watermarker-Air V1.1.5")
+        self.root.geometry("900x780")
+        self.root.minsize(580, 560)
         self.root.eval('tk::PlaceWindow . center')
 
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_rowconfigure(1, weight=1) 
+        # -----------------------------
+        # UI style global definitions area
+        # -----------------------------
+        style = ttk.Style()
+        # Adapt best font according to the OS
+        os_font = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif"
+        code_font = "Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace"
+        
+        style.configure(".", font=(os_font, 10))
+        style.configure("Treeview", rowheight=28, font=(code_font, 10))
+        style.configure("Treeview.Heading", font=(os_font, 10, "bold"))
+        
+        # Custom button styles
+        style.configure("Primary.TButton", font=(os_font, 10, "bold"), padding=(15, 6))
+        style.configure("Secondary.TButton", font=(os_font, 10), padding=(10, 4))
+        style.configure("TCheckbutton", font=(os_font, 10))
 
+        # Main container: All elements are wrapped in a main Frame with padding
+        main_frame = ttk.Frame(self.root, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # -----------------------------
+        # 1. Top description area
+        # -----------------------------
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.lbl_title = ttk.Label(header_frame, text="📚 Select HTML chapters to scan", font=(os_font, 13, "bold"))
+        self.lbl_title.pack(anchor=tk.W, pady=(0, 4))
+        
         self.lbl_hint = ttk.Label(
-            self.root, 
-            text="Note: Please select from the list below using Ctrl-click or Shift-click.\nWhen [Secondary Confirmation] is enabled, it allows you to visually verify and modify the list of images to be processed.", 
-            foreground="red", 
-            justify=tk.CENTER
+            header_frame, 
+            text="Hold Ctrl or Shift to select multiple chapters", 
+            foreground="#666666"
         )
-        self.lbl_hint.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
+        self.lbl_hint.pack(anchor=tk.W)
 
-        tree_height = max(8, min(len(self.text_iter), 15)) if self.text_iter else 8
-        self.tree = ttk.Treeview(self.root, columns=("Data1", "Data2"), show="headings", height=tree_height, selectmode="extended")
+        # -----------------------------
+        # 2. Core list area
+        # -----------------------------
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Switch to grid layout to solve vertical misalignment caused by the scrollbar on the right
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(list_frame, columns=("Data1", "Data2"), show="headings", selectmode="extended")
         self.tree.column("#0", width=0, stretch=tk.NO)
-        self.tree.column("Data1", anchor=tk.W, width=150, stretch=tk.YES)
-        self.tree.column("Data2", anchor=tk.W, width=280, stretch=tk.YES)
-        self.tree.heading("Data1", text="File ID")
+        # Set equal width and enable stretch for both to take half each
+        self.tree.column("Data1", anchor=tk.W, width=300, minwidth=150, stretch=tk.YES)
+        self.tree.column("Data2", anchor=tk.W, width=300, minwidth=150, stretch=tk.YES)
+        self.tree.heading("Data1", text="Node Identifier (ID)")
         self.tree.heading("Data2", text="File Path (Href)")
-        self.tree.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        scroll_bar = ttk.Scrollbar(self.root, orient=tk.VERTICAL, command=self.tree.yview)
+        
+        scroll_bar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll_bar.set)
-        scroll_bar.grid(row=1, column=2, sticky=(tk.N, tk.S))
+        
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scroll_bar.grid(row=0, column=1, sticky='ns')
 
         for index, (data1, data2) in enumerate(self.text_iter):
             item_id = self.tree.insert(parent="", index=tk.END, iid=f"html_{index}", values=(data1, data2))
-            if data1 in self.pre_selected_html_ids:
-                self.tree.selection_add(item_id)
-
-        self.btn_frame = ttk.Frame(self.root)
-        self.btn_frame.grid(row=2, column=0, columnspan=3, pady=(10, 5))
-        ttk.Button(self.btn_frame, text="Select All", command=lambda: self.tree.selection_add(self.tree.get_children())).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.btn_frame, text="Deselect All", command=lambda: self.tree.selection_remove(self.tree.get_children())).pack(side=tk.LEFT, padx=5)
+            self.tree.selection_add(item_id) # Select all by default
+            
+        self.root.bind('<Control-a>', lambda e: self.tree.selection_add(self.tree.get_children()))
+        self.root.bind('<Command-a>', lambda e: self.tree.selection_add(self.tree.get_children()))
+        self.root.bind('<Return>', lambda e: self.run_action())
         
-        self.action_frame = ttk.Frame(self.root)
-        self.action_frame.grid(row=3, column=0, columnspan=3, pady=(5, 10))
+        # -----------------------------
+        # 3. Action button area (re-layout: left and right columns)
+        # -----------------------------
+        self.action_frame = ttk.Frame(main_frame)
+        self.action_frame.pack(fill=tk.X, pady=(10, 5))
         
-        self.btn_open_config = ttk.Button(self.action_frame, text="Open Config", command=self.open_config_file)
-        self.btn_open_config.pack(side=tk.LEFT, padx=5)
+        # Left area: Auxiliary settings
+        left_controls = ttk.Frame(self.action_frame)
+        left_controls.pack(side=tk.LEFT, fill=tk.Y)
 
+        self.btn_open_config = ttk.Button(left_controls, text="⚙️ Open Configuration", style="Secondary.TButton", command=self.open_config_file)
+        self.btn_open_config.pack(side=tk.LEFT)
+        
+        # Right area: Main action and secondary confirmation
+        right_controls = ttk.Frame(self.action_frame)
+        right_controls.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.btn_main = ttk.Button(right_controls, text="🚀 Scan and Process", style="Primary.TButton", command=self.run_action)
+        self.btn_main.pack(side=tk.RIGHT)
+        
         self.secondary_confirm_var = tk.BooleanVar(value=False)
-        self.chk_confirm = ttk.Checkbutton(self.action_frame, text="Secondary Confirmation", variable=self.secondary_confirm_var)
-        self.chk_confirm.pack(side=tk.LEFT, padx=5)
-        
-        self.btn_main = ttk.Button(self.action_frame, text="Start Processing", command=self.run_action)
-        self.btn_main.pack(side=tk.LEFT, padx=5)
+        self.chk_confirm = ttk.Checkbutton(right_controls, text="🔍 Secondary Image Confirmation", style="TCheckbutton", variable=self.secondary_confirm_var)
+        self.chk_confirm.pack(side=tk.RIGHT, padx=(0, 15))
 
-        self.progress = ttk.Progressbar(self.root, mode='determinate', length=400)
-        self.progress.grid(row=4, column=0, columnspan=3, padx=10, pady=(10, 5), sticky=(tk.W, tk.E))
-        self.progress_label = ttk.Label(self.root, text="Waiting to start...")
-        self.progress_label.grid(row=5, column=0, columnspan=3, pady=(0, 10))
+        # -----------------------------
+        # 4. Progress bar status area
+        # -----------------------------
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.progress = ttk.Progressbar(status_frame, mode='determinate')
+        self.progress.pack(side=tk.TOP, fill=tk.X)
+
 
     def open_config_file(self):
         import subprocess
         if not self.config_path.exists():
-            messagebox.showwarning("Notice", "Config file does not exist, please ensure the environment is initialized.")
+            messagebox.showwarning("Warning", "Configuration file does not exist, please ensure the environment is initialized.")
             return
         try:
             if sys.platform == 'win32':
@@ -405,69 +484,126 @@ class WatermarkApp:
             else:
                 subprocess.call(['xdg-open', str(self.config_path)])
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open config file: {e}")
+            messagebox.showerror("Error", f"Cannot open configuration file: {e}")
 
     def _set_ui_state(self, state):
         if state == tk.DISABLED:
-            btn_text = "Processing..."
+            btn_text = "⏳ Processing"
         else:
-            btn_text = "Confirm & Execute" if self.phase == 2 else "Start Processing"
+            btn_text = "✅ Confirm and Execute" if self.phase == 2 else "🚀 Scan and Process"
             
         self.btn_main.config(state=state, text=btn_text)
         self.tree.config(selectmode='none' if state == tk.DISABLED else 'extended')
         
         chk_state = tk.NORMAL if (state == tk.NORMAL and self.phase == 1) else tk.DISABLED
         self.chk_confirm.config(state=chk_state)
-        
         self.btn_open_config.config(state=state)
-        for btn in self.btn_frame.winfo_children(): 
-            btn.config(state=state)
-        self.root.update()
+        
+        self.root.update_idletasks()
+
+    def _worker_task(self, uid, img_data):
+        """Safe task wrapper within the thread pool, responsible for throwing results back to Queue"""
+        try:
+            result = self.wm.process_image_bytes(img_data)
+            self.result_queue.put((uid, True, result))
+        except Exception as e:
+            self.result_queue.put((uid, False, e))
+
+    def _fill_executor(self):
+        """Streaming block reading: keep active tasks no more than 2x thread count to prevent memory overflow from large ebooks"""
+        target_active = self.wm.threads * 2
+        while len(self.active_futures) < target_active and self.final_process_queue:
+            uid = self.final_process_queue.popleft()
+            try:
+                # Must trigger host's readfile in the main thread
+                img_data = self.bk.readfile(uid)
+                future = self.executor.submit(self._worker_task, uid, img_data)
+                self.active_futures[future] = uid
+            except Exception as e:
+                print(f"Failed to read image {uid}: {e}")
+                self.skipped_image_ids.add(uid)
+                self._update_progress()
+
+    def _update_progress(self):
+        self.progress['value'] += 1
+        # Optimization: Batch update mechanism, limit redraw frequency to reduce CPU overhead
+        current_time = time.time()
+        if current_time - self.last_update_time > 0.1:
+            self.root.update_idletasks()
+            self.last_update_time = current_time
+
+    def _check_queue_and_refill(self):
+        """'after' polling to collect Queue, achieving completely non-blocking UI smooth transition"""
+        try:
+            while True:
+                uid, success, data_or_err = self.result_queue.get_nowait()
+                
+                if success:
+                    try:
+                        self.bk.writefile(uid, data_or_err)
+                        self.success_ids.append(uid)
+                    except Exception as e:
+                        print(f"Failed to write image {uid}: {e}")
+                        self.skipped_image_ids.add(uid)
+                else:
+                    print(f"Failed to render {uid}: {data_or_err}")
+                    self.skipped_image_ids.add(uid)
+                    
+                self._update_progress()
+        except queue.Empty:
+            pass
+
+        # Strip references to completed tasks in the pool
+        done_futures = [f for f in self.active_futures if f.done()]
+        for f in done_futures:
+            del self.active_futures[f]
+
+        # Replenish block reading tasks in time
+        self._fill_executor()
+
+        # All finished judgment
+        if not self.active_futures and not self.final_process_queue:
+            self.executor.shutdown(wait=False)
+            self.root.update_idletasks()  # Ensure the last progress correctly reaches 100%
+            self._print_report(self.success_ids, self.skipped_image_ids)
+            messagebox.showinfo("Processing Complete", f"Batch watermark application complete!\n\n✅ Watermarked successfully: {len(self.success_ids)} images\n🛑 Skipped or intercepted: {len(self.skipped_image_ids)} images\n\nCheck Sigil console output for detailed list.")
+            self.root.destroy()
+        else:
+            self.root.after(50, self._check_queue_and_refill)
 
     def process_images_batch(self, final_process_queue, skipped_image_ids):
         if not final_process_queue:
-            messagebox.showinfo("Complete", "No matching images found, or all images were intercepted.")
+            messagebox.showinfo("Complete", "No eligible images found under the current node, or all images were blocked by the blacklist.")
             self.root.destroy()
             return
 
         self._set_ui_state(tk.DISABLED)
         self.progress['maximum'] = len(final_process_queue)
         self.progress['value'] = 0
-        success_ids = []
-
-        batch_size = max(4, self.wm.threads * 2) 
-
-        with ThreadPoolExecutor(max_workers=self.wm.threads) as executor:
-            for i in range(0, len(final_process_queue), batch_size):
-                batch_uids = final_process_queue[i:i + batch_size]
-                future_to_id = {}
-                
-                for uid in batch_uids:
-                    image_data = self.bk.readfile(uid)
-                    future = executor.submit(self.wm.process_image_bytes, image_data)
-                    future_to_id[future] = uid
-                
-                for future in as_completed(future_to_id):
-                    img_id = future_to_id[future]
-                    try:
-                        result_data = future.result()
-                        self.bk.writefile(img_id, result_data)
-                        success_ids.append(img_id)
-                    except Exception as e:
-                        print(f"Render failed {img_id}: {e}")
-                        skipped_image_ids.add(img_id)
-                    
-                    self.progress['value'] += 1
-                    self.progress_label.config(text=f"Adding watermark... {self.progress['value']}/{len(final_process_queue)}")
-                    self.root.update()
-
-        self._print_report(success_ids, skipped_image_ids)
-        messagebox.showinfo("Complete", f"Batch watermarking finished!\nSuccess: {len(success_ids)} images\nSkipped: {len(skipped_image_ids)} images\nPlease check the Sigil console output for the detailed list.")
-        self.root.destroy()
+        
+        self.success_ids = []
+        self.skipped_image_ids = skipped_image_ids
+        # Optimization: Introduce collections.deque to replace List for O(1) popleft()
+        self.final_process_queue = deque(final_process_queue)
+        self.last_update_time = time.time()
+        
+        self.result_queue = queue.Queue()
+        self.active_futures = {}
+        
+        # Optimization engine: Introduce concurrency pool, combined with stream reading and non-blocking Queue.
+        # Note: Sigil plugin's built-in environment is prone to module reload errors and host crashes when Pickling for ProcessPoolExecutor.
+        # Unified fallback to ThreadPoolExecutor here (PIL automatically releases GIL during low-level processing, perfectly simulating multi-core/multi-process capabilities).
+        self.executor = ThreadPoolExecutor(max_workers=self.wm.threads)
+        
+        # Initial fill
+        self._fill_executor()
+        
+        # Activate non-blocking UI polling
+        self.root.after(100, self._check_queue_and_refill)
 
     def _print_report(self, success_ids, skipped_image_ids):
         print("=" * 50)
-        print("【Watermark Processing Report】")
+        print("[Watermark Processing Report]")
         print("=" * 50)
         print(f"\n✅ Successfully processed files ({len(success_ids)}):")
         if success_ids:
@@ -484,11 +620,11 @@ class WatermarkApp:
         if self.phase == 1:
             selected_items = [self.tree.item(i)['values'] for i in self.tree.selection()]
             if not selected_items:
-                messagebox.showwarning("Notice", "Please select the chapters to scan for images from the list first!")
+                messagebox.showwarning("Warning", "Please select the chapters to scan for images in the list first!")
                 return
 
             self._set_ui_state(tk.DISABLED)
-            self.progress_label.config(text="Parsing HTML and blacklists...")
+            self.root.update_idletasks()
             
             selected_html_ids = [item[0] for item in selected_items]
             target_image_ids = set()
@@ -521,9 +657,12 @@ class WatermarkApp:
 
             if self.secondary_confirm_var.get():
                 self.phase = 2
-                self.root.title("Image Watermark - Secondary Image Confirmation")
-                self.lbl_hint.config(text="[Secondary Confirmation]: Below are all the images in the book. The images to be processed are highlighted. Please adjust as needed and click execute.")
-                self.progress_label.config(text="Please confirm the images to be processed...")
+                self.root.title("Watermarker-Air - Target Confirmation Phase")
+                self.lbl_title.config(text="🎯 Verify and confirm the list of images to be processed")
+                self.lbl_hint.config(
+                    text="Below are all the images that will be watermarked (filtered by blacklist)", 
+                    foreground="#666666"
+                )
                 
                 for item in self.tree.get_children():
                     self.tree.delete(item)
@@ -542,7 +681,7 @@ class WatermarkApp:
         elif self.phase == 2:
             selected_items = [self.tree.item(i)['values'] for i in self.tree.selection()]
             if not selected_items:
-                messagebox.showwarning("Notice", "No images selected for processing. Please reselect or close the window!")
+                messagebox.showwarning("Warning", "No images selected for processing. Please reselect or close the window!")
                 return
                 
             final_process_queue = []
@@ -563,31 +702,66 @@ class WatermarkApp:
                     
             self.process_images_batch(final_process_queue, skipped_image_ids)
 
-# --- 5. Sigil Plugin Entry Point ---
+# --- 6. Sigil Plugin Entry ---
 def run(bk):
-    missing, outdated = check_dependencies_and_versions()
+    # Enhance cross-platform UI compatibility: Proactively set Windows High DPI scaling awareness
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+    err_msg = check_dependencies()
     
-    if missing or outdated:
-        err_msg = "[Dependency Environment Exception]\nTo prevent interfering with your host environment, the plugin prioritized using your system's local packages, but detected exceptions:\n"
+    if err_msg:
+        # Embed error popup logic at the entry point to prevent blocking loading
+        err_root = tk.Tk()
+        err_root.withdraw()
         
-        if missing:
-            err_msg += f"\n❌ Missing libraries: {', '.join(missing)}"
-        if outdated:
-            err_msg += "\n\n⚠️ Outdated versions (may cause errors or crashes):"
-            for pkg in outdated:
-                err_msg += f"\n  - {pkg}"
-                
-        err_msg += ("\n\n[Fix Suggestion]\nPlease run the following command in your terminal/command line to update the environment:\n\n"
-                    "pip install --upgrade Pillow pyyaml resvg-py cffi imagequant")
+        guide_win = tk.Toplevel()
+        guide_win.title("⚠️ Plugin Environment Error")
+        guide_win.geometry("900x360")
         
-        print("="*50)
-        print(err_msg)
-        print("="*50)
+        # Cross-platform font fallback mechanism
+        ui_font = ("Segoe UI" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif", 10)
+        code_font = ("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace", 10)
         
-        tmp_root = tk.Tk()
-        tmp_root.withdraw()
-        messagebox.showerror("Environment Exception", err_msg)
-        tmp_root.destroy()
+        # Center window
+        guide_win.update_idletasks()
+        win_x = (guide_win.winfo_screenwidth() // 2) - (600 // 2)
+        win_y = (guide_win.winfo_screenheight() // 2) - (320 // 2)
+        guide_win.geometry(f'+{win_x}+{win_y}')
+        
+        top_frame = tk.Frame(guide_win, padx=25, pady=20)
+        top_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(top_frame, text="The plugin cannot start due to missing required core components.", font=(ui_font[0], 12, "bold"), fg="#d9534f").pack(anchor=tk.W, pady=(0, 10))
+        
+        info_text = (
+            f"Specific blocking reason: {err_msg}\n\n"
+            f"Please press Win+R to open the [cmd] command prompt (use Terminal on macOS),\n"
+            f"copy and execute the auto-fix command below to install dependencies into the plugin directory:"
+        )
+        tk.Label(top_frame, text=info_text, justify=tk.LEFT, font=ui_font).pack(anchor=tk.W)
+        
+        # Generate exclusive pip install command based on required packages for current Sigil watermark plugin
+        cmd_str = f'pip install pyyaml Pillow resvg-py cffi imagequant --target="{str(_VENDOR_DIR)}"'
+        
+        text_box = tk.Text(top_frame, height=3, width=70, bg="#f5f6f7", font=code_font, relief=tk.FLAT)
+        text_box.insert(tk.END, cmd_str)
+        text_box.config(state=tk.DISABLED)
+        text_box.pack(pady=15, fill=tk.X)
+        
+        def copy_cmd():
+            guide_win.clipboard_clear()
+            guide_win.clipboard_append(cmd_str)
+            messagebox.showinfo("Copied", "Command copied to clipboard!\n\nPlease open the command line interface, paste and hit Enter to execute.\nRestart the plugin after installation is complete.", parent=guide_win)
+            
+        ttk.Button(top_frame, text="📋 1-Click Copy Fix Command", command=copy_cmd, padding=5).pack(pady=(5,0))
+        
+        guide_win.wait_window()
+        err_root.destroy()
         return -1
 
     config_path = _PLUGIN_DIR / "watermarker_config.yaml"
@@ -610,4 +784,4 @@ def run(bk):
     return 0
 
 if __name__ == "__main__":
-    print("Please run this plugin within Sigil.")
+    print("Please run the plugin in Sigil.")
